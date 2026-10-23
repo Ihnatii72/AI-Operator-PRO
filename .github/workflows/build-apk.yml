@@ -33,10 +33,10 @@ jobs:
         with:
           packages: 'platform-tools'
 
-      - name: Apply Hyperlapse beta patch
+      - name: Apply Hyperlapse V2 patch
         run: |
-          git apply --check Hyperlapse_V1.patch
-          git apply Hyperlapse_V1.patch
+          git apply --check Hyperlapse_V1-1.patch
+          git apply Hyperlapse_V1-1.patch
 
       - name: Fix Kotlin permission callback
         run: |
@@ -52,7 +52,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: AI-Operator-PRO-Hyperlapse-APK
+          name: AI-Operator-PRO-Hyperlapse-V2
           path: app/build/outputs/apk/stable/debug/*.apk
           if-no-files-found: error
           retention-days: 14
