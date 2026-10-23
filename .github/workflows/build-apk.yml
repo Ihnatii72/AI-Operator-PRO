@@ -33,6 +33,11 @@ jobs:
         with:
           packages: 'platform-tools'
 
+      - name: Apply Hyperlapse beta patch
+        run: |
+          git apply --check Hyperlapse_V1.patch
+          git apply Hyperlapse_V1.patch
+
       - name: Build AI Operator PRO APK
         run: |
           chmod +x gradlew
@@ -42,7 +47,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: AI-Operator-PRO-APK
+          name: AI-Operator-PRO-Hyperlapse-APK
           path: app/build/outputs/apk/stable/debug/*.apk
           if-no-files-found: error
           retention-days: 14
