@@ -1,0 +1,603 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -90,4 +90,9 @@
+ dependencies {
++    implementation(libs.camera.camera2)
++    implementation(libs.camera.core)
++    implementation(libs.camera.lifecycle)
++    implementation("androidx.camera:camera-view:1.7.0-SNAPSHOT")
++    implementation("org.opencv:opencv:4.12.0")
+     implementation(libs.androidx.tracing)
+     implementation(project(":core:common"))
+     implementation(project(":core:camera"))
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -66,5 +66,16 @@
+             </intent-filter>
+         </activity>
++        <!-- Separate beta launcher; existing photo/video camera stays unchanged. -->
++        <activity
++            android:name=".HyperlapseActivity"
++            android:exported="true"
++            android:screenOrientation="landscape"
++            android:label="Hyperlapse (beta)">
++            <intent-filter>
++                <action android:name="android.intent.action.MAIN" />
++                <category android:name="android.intent.category.LAUNCHER" />
++            </intent-filter>
++        </activity>
+         <provider
+             android:name="androidx.core.content.FileProvider"
+             android:authorities="${applicationId}.fileprovider"
+diff --git a/app/src/main/java/com/google/jetpackcamera/HyperlapseActivity.kt b/app/src/main/java/com/google/jetpackcamera/HyperlapseActivity.kt
+new file mode 100644
+--- /dev/null
++++ b/app/src/main/java/com/google/jetpackcamera/HyperlapseActivity.kt
+@@ -0,0 +1,565 @@
++package com.google.jetpackcamera
++
++import android.Manifest
++import android.content.ContentValues
++import android.content.pm.ActivityInfo
++import android.content.pm.PackageManager
++import android.graphics.Canvas
++import android.graphics.Color
++import android.graphics.Paint
++import android.media.MediaCodec
++import android.media.MediaCodecInfo
++import android.media.MediaFormat
++import android.media.MediaMuxer
++import android.os.Build
++import android.os.Bundle
++import android.os.SystemClock
++import android.provider.MediaStore
++import android.util.Size
++import android.view.Gravity
++import android.view.MotionEvent
++import android.view.View
++import android.view.WindowManager
++import android.widget.Button
++import android.widget.FrameLayout
++import android.widget.LinearLayout
++import android.widget.TextView
++import androidx.activity.ComponentActivity
++import androidx.camera.core.CameraSelector
++import androidx.camera.core.ImageAnalysis
++import androidx.camera.core.ImageProxy
++import androidx.camera.core.Preview
++import androidx.camera.lifecycle.ProcessCameraProvider
++import androidx.camera.view.PreviewView
++import androidx.core.content.ContextCompat
++import org.opencv.android.OpenCVLoader
++import org.opencv.core.CvType
++import org.opencv.core.Rect
++import org.opencv.core.Mat
++import org.opencv.core.MatOfByte
++import org.opencv.core.MatOfFloat
++import org.opencv.core.MatOfPoint2f
++import org.opencv.core.Point
++import org.opencv.core.Size as CvSize
++import org.opencv.core.TermCriteria
++import org.opencv.video.Video
++import org.opencv.imgproc.Imgproc
++import java.io.File
++import java.util.concurrent.Executors
++import kotlin.math.min
++import kotlin.math.abs
++import kotlin.math.hypot
++import kotlin.math.roundToInt
++
++/**
++ * Experimental anchor-locked hyperlapse.
++ * Back camera only. Fixed landscape UX during the first test release.
++ * The source preview is not modified; the written H.264 MP4 is re-framed so the
++ * selected feature stays near the center. Select a visually textured corner.
++ */
++class HyperlapseActivity : ComponentActivity() {
++    private val analyzerExecutor = Executors.newSingleThreadExecutor()
++    private lateinit var preview: PreviewView
++    private lateinit var marker: MarkerView
++    private lateinit var status: TextView
++    private lateinit var record: Button
++
++    @Volatile private var pendingTap: Pair<Float, Float>? = null
++    @Volatile private var startRequested = false
++    @Volatile private var stopRequested = false
++    @Volatile private var isRecording = false
++    @Volatile private var chosenScreenPoint: Pair<Float, Float>? = null
++    @Volatile private var isTracking = false
++    @Volatile private var lastRotation = 0
++    @Volatile private var frameWidth = 1280
++    @Volatile private var frameHeight = 720
++
++    // These fields are used only on analyzerExecutor.
++    private var grayBefore: Mat? = null
++    private var tracked: Point? = null
++    private var features: List<Point> = emptyList()
++    private var video: SampledVideoEncoder? = null
++    private var savedFrames = 0
++    private var lastSavedAt = 0L
++    private var ready = false
++
++    override fun onCreate(savedInstanceState: Bundle?) {
++        super.onCreate(savedInstanceState)
++        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
++        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
++        window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_FULLSCREEN
++        if (!OpenCVLoader.initLocal()) {
++            TextView(this).apply {
++                text = "OpenCV не запустился"
++                setTextColor(Color.WHITE)
++                setBackgroundColor(Color.BLACK)
++                this@HyperlapseActivity.setContentView(this)
++            }
++            return
++        }
++        val screen = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
++        preview = PreviewView(this).apply {
++            scaleType = PreviewView.ScaleType.FIT_CENTER
++        }
++        screen.addView(preview, FrameLayout.LayoutParams(-1, -1))
++        marker = MarkerView().apply {
++            setOnTouchListener { _, e ->
++                if (e.action == MotionEvent.ACTION_DOWN) {
++                    if (isRecording || startRequested) {
++                        showStatus("Для смены точки останови запись")
++                    } else {
++                        val tap = (e.x / width) to (e.y / height)
++                        chosenScreenPoint = tap
++                        pendingTap = tap
++                        isTracking = false
++                        marker.invalidate()
++                        showStatus("Выбираем точку…")
++                    }
++                    true
++                } else true
++            }
++        }
++        screen.addView(marker, FrameLayout.LayoutParams(-1, -1))
++
++        val controls = LinearLayout(this).apply {
++            orientation = LinearLayout.VERTICAL
++            setPadding(16, 8, 16, 8)
++            setBackgroundColor(0x99000000.toInt())
++        }
++        status = TextView(this).apply {
++            text = "Тапни по окну, углу или другой детали здания"
++            setTextColor(Color.WHITE)
++            textSize = 15f
++            gravity = Gravity.CENTER
++        }
++        record = Button(this).apply {
++            text = "●  НАЧАТЬ"
++            setOnClickListener {
++                if (isRecording || startRequested) {
++                    stopRequested = true
++                    text = "СОХРАНЕНИЕ…"
++                    isEnabled = false
++                } else {
++                    startRequested = true
++                    showStatus("Начинаем гиперлапс…")
++                }
++            }
++        }
++        controls.addView(status)
++        controls.addView(record)
++        screen.addView(controls, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
++        setContentView(screen)
++
++        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
++            initializeCamera()
++        } else {
++            requestPermissions(arrayOf(Manifest.permission.CAMERA), 170)
++        }
++    }
++
++    @Deprecated("Uses requestPermissions for compatibility with app minSdk")
++    override fun onRequestPermissionsResult(code: Int, permissions: Array<String>, results: IntArray) {
++        super.onRequestPermissionsResult(code, permissions, results)
++        if (code == 170 && results.firstOrNull() == PackageManager.PERMISSION_GRANTED) initializeCamera()
++        else showStatus("Нужно разрешение на камеру")
++    }
++
++    private fun initializeCamera() {
++        val future = ProcessCameraProvider.getInstance(this)
++        future.addListener({
++            try {
++                val provider = future.get()
++                val viewfinder = Preview.Builder().build().also { it.surfaceProvider = preview.surfaceProvider }
++                val analysis = ImageAnalysis.Builder()
++                    .setTargetResolution(Size(1280, 720))
++                    .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
++                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
++                    .build()
++                analysis.setAnalyzer(analyzerExecutor, ::analyze)
++                provider.unbindAll()
++                provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, viewfinder, analysis)
++                ready = true
++            } catch (e: Exception) {
++                showStatus("Камера: ${e.message}")
++            }
++        }, ContextCompat.getMainExecutor(this))
++    }
++
++    /** Select nearby corners, so a single ambiguous pixel cannot drag the lock. */
++    private fun selectFeatureCluster(gray: Mat, chosen: Point): List<Point> {
++        val radius = 74
++        val x = (chosen.x.toInt() - radius).coerceIn(0, gray.cols() - 1)
++        val y = (chosen.y.toInt() - radius).coerceIn(0, gray.rows() - 1)
++        val right = (chosen.x.toInt() + radius).coerceIn(x + 1, gray.cols())
++        val bottom = (chosen.y.toInt() + radius).coerceIn(y + 1, gray.rows())
++        val roi = gray.submat(Rect(x, y, right - x, bottom - y))
++        val corners = org.opencv.core.MatOfPoint()
++        return try {
++            Imgproc.goodFeaturesToTrack(roi, corners, 36, 0.02, 9.0)
++            corners.toArray().map { Point(it.x + x, it.y + y) }
++        } finally {
++            corners.release()
++            roi.release()
++        }
++    }
++
++    private fun median(items: List<Double>): Double {
++        val sorted = items.sorted()
++        return if (sorted.size % 2 == 0) (sorted[sorted.size / 2 - 1] + sorted[sorted.size / 2]) / 2.0
++        else sorted[sorted.size / 2]
++    }
++
++    /** Forward/backward optical flow + consensus prevents the crosshair from jumping between edges. */
++    private fun updateTracking(previous: Mat, current: Mat): Boolean {
++        if (features.size < 5 || tracked == null) return false
++        val from = MatOfPoint2f(*features.toTypedArray())
++        val to = MatOfPoint2f()
++        val status = MatOfByte()
++        val errors = MatOfFloat()
++        val back = MatOfPoint2f()
++        val backStatus = MatOfByte()
++        val backErrors = MatOfFloat()
++        try {
++            val window = CvSize(25.0, 25.0)
++            val criteria = TermCriteria(TermCriteria.COUNT + TermCriteria.EPS, 25, 0.025)
++            Video.calcOpticalFlowPyrLK(previous, current, from, to, status, errors, window, 3, criteria)
++            Video.calcOpticalFlowPyrLK(current, previous, to, back, backStatus, backErrors, window, 3, criteria)
++            val next = to.toArray()
++            val returned = back.toArray()
++            val ok = status.toArray()
++            val okBack = backStatus.toArray()
++            val valid = mutableListOf<Triple<Point, Double, Double>>()
++            for (i in features.indices) {
++                if (i >= next.size || i >= returned.size || i >= ok.size || i >= okBack.size) continue
++                if (ok[i].toInt() != 1 || okBack[i].toInt() != 1) continue
++                val p = features[i]
++                val q = next[i]
++                if (!q.x.isFinite() || !q.y.isFinite() ||
++                    q.x < 3 || q.x >= current.cols() - 3 ||
++                    q.y < 3 || q.y >= current.rows() - 3) continue
++                if (hypot(returned[i].x - p.x, returned[i].y - p.y) > 2.5) continue
++                val dx = q.x - p.x
++                val dy = q.y - p.y
++                if (hypot(dx, dy) > 110.0) continue
++                valid.add(Triple(q, dx, dy))
++            }
++            if (valid.size < 5) return false
++            val medX = median(valid.map { it.second })
++            val medY = median(valid.map { it.third })
++            val consistent = valid.filter { hypot(it.second - medX, it.third - medY) <= 3.5 }
++            if (consistent.size < 5) return false
++            val dx = median(consistent.map { it.second })
++            val dy = median(consistent.map { it.third })
++            val old = tracked ?: return false
++            val moved = Point(old.x + dx, old.y + dy)
++            if (moved.x !in 4.0..(current.cols() - 4.0) ||
++                moved.y !in 4.0..(current.rows() - 4.0)) return false
++            tracked = moved
++            features = consistent.map { it.first }
++            return true
++        } finally {
++            from.release(); to.release(); status.release(); errors.release()
++            back.release(); backStatus.release(); backErrors.release()
++        }
++    }
++
++    private fun analyze(image: ImageProxy) {
++        try {
++            if (!ready) return
++            val w = image.width
++            val h = image.height
++            frameWidth = w
++            frameHeight = h
++            lastRotation = image.imageInfo.rotationDegrees
++            val yPlane = image.planes[0]
++            val current = Mat(h, w, CvType.CV_8UC1)
++            val pixels = ByteArray(w * h)
++            val planeBuffer = yPlane.buffer
++            for (row in 0 until h) {
++                for (column in 0 until w) {
++                    pixels[row * w + column] = planeBuffer.get(row * yPlane.rowStride + column * yPlane.pixelStride)
++                }
++            }
++            current.put(0, 0, pixels)
++            try {
++                val tap = pendingTap
++                if (tap != null) {
++                    pendingTap = null
++                    val chosen = displayToImage(tap.first, tap.second, w, h, lastRotation)
++                    if (chosen != null) {
++                        val selected = selectFeatureCluster(current, chosen)
++                        if (selected.size >= 6) {
++                            tracked = chosen
++                            features = selected
++                            isTracking = true
++                            showStatus("Точка зафиксирована. Прицел останется на месте")
++                        } else {
++                            tracked = null
++                            features = emptyList()
++                            isTracking = false
++                            showStatus("Мало деталей рядом. Нажми на контрастный угол")
++                        }
++                    } else {
++                        tracked = null
++                        features = emptyList()
++                        isTracking = false
++                        chosenScreenPoint = null
++                        showStatus("Выбери точку внутри изображения")
++                    }
++                    marker.postInvalidate()
++                } else if (tracked != null && grayBefore != null) {
++                    if (updateTracking(grayBefore!!, current)) {
++                        isTracking = true
++                    } else {
++                        tracked = null
++                        features = emptyList()
++                        isTracking = false
++                        marker.postInvalidate()
++                        if (isRecording) {
++                            stopRequested = true
++                            showStatus("Точка потеряна — сохраняем запись. Выбери её снова")
++                        } else showStatus("Точка потеряна. Нажми на неё снова")
++                    }
++                }
++                if (startRequested) {
++                    startRequested = false
++                    if (!isTracking || tracked == null) {
++                        showStatus("Сначала выбери контрастную точку")
++                    } else {
++                        try {
++                            video = SampledVideoEncoder(File(cacheDir, "locked_hyperlapse.mp4"), w, h, lastRotation)
++                            isRecording = true
++                            savedFrames = 0
++                            lastSavedAt = 0L
++                            runOnUiThread { record.text = "■  ОСТАНОВИТЬ" }
++                            showStatus("Запись · 6× · точка зафиксирована")
++                        } catch (e: Exception) {
++                            showStatus("Ошибка кодека: ${e.message}")
++                        }
++                    }
++                }
++                if (isRecording && tracked != null && !stopRequested) {
++                    val now = SystemClock.elapsedRealtime()
++                    if (now - lastSavedAt >= 200L) {
++                        try {
++                            video?.addFrame(image, tracked!!, savedFrames.toLong())
++                            savedFrames++
++                            lastSavedAt = now
++                            if (savedFrames % 15 == 0) showStatus("Записано $savedFrames кадров · точка удерживается")
++                        } catch (e: Exception) {
++                            stopRequested = true
++                            showStatus("Ошибка записи: ${e.message}")
++                        }
++                    }
++                }
++                if (stopRequested && isRecording) {
++                    stopRequested = false
++                    isRecording = false
++                    try {
++                        video?.finish()
++                        video = null
++                        val file = File(cacheDir, "locked_hyperlapse.mp4")
++                        if (savedFrames > 0 && file.length() > 100) {
++                            val uri = publishVideo(file)
++                            showStatus(if (uri != null) "Готово! Видео в Галерее / Movies" else "Не удалось сохранить в галерею")
++                        } else showStatus("Недостаточно кадров. Запиши дольше")
++                    } catch (e: Exception) {
++                        showStatus("Не удалось завершить MP4: ${e.message}")
++                    }
++                    runOnUiThread {
++                        record.text = "●  НАЧАТЬ"
++                        record.isEnabled = true
++                    }
++                }
++            } finally {
++                grayBefore?.release()
++                grayBefore = current
++            }
++        } catch (e: Exception) {
++            showStatus("Ошибка обработки: ${e.message}")
++        } finally {
++            image.close()
++        }
++    }
++
++    private fun displayToImage(nx: Float, ny: Float, w: Int, h: Int, rotation: Int): Point? {
++        val rw = if (rotation % 180 == 0) w.toDouble() else h.toDouble()
++        val rh = if (rotation % 180 == 0) h.toDouble() else w.toDouble()
++        val pvW = preview.width.toDouble().coerceAtLeast(1.0)
++        val pvH = preview.height.toDouble().coerceAtLeast(1.0)
++        val scale = min(pvW / rw, pvH / rh)
++        val dx = (nx * pvW - (pvW - rw * scale) / 2) / scale
++        val dy = (ny * pvH - (pvH - rh * scale) / 2) / scale
++        if (dx < 0 || dy < 0 || dx >= rw || dy >= rh) return null
++        return when (rotation) {
++            90 -> Point(dy, h - dx)
++            180 -> Point(w - dx, h - dy)
++            270 -> Point(w - dy, dx)
++            else -> Point(dx, dy)
++        }
++    }
++
++    private fun showStatus(message: String) {
++        if (::status.isInitialized) runOnUiThread { status.text = message }
++    }
++
++    private fun publishVideo(source: File): android.net.Uri? {
++        val values = ContentValues().apply {
++            put(MediaStore.Video.Media.DISPLAY_NAME, "AI_Hyperlapse_${System.currentTimeMillis()}.mp4")
++            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
++            if (Build.VERSION.SDK_INT >= 29) {
++                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/AI Operator PRO")
++                put(MediaStore.Video.Media.IS_PENDING, 1)
++            }
++        }
++        val collection = if (Build.VERSION.SDK_INT >= 29) {
++            MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
++        } else MediaStore.Video.Media.EXTERNAL_CONTENT_URI
++        val uri = contentResolver.insert(collection, values) ?: return null
++        return try {
++            contentResolver.openOutputStream(uri)?.use { out -> source.inputStream().use { it.copyTo(out) } }
++                ?: error("Output stream unavailable")
++            if (Build.VERSION.SDK_INT >= 29) {
++                contentResolver.update(uri, ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }, null, null)
++            }
++            uri
++        } catch (e: Exception) {
++            contentResolver.delete(uri, null, null)
++            null
++        }
++    }
++
++    override fun onDestroy() {
++        super.onDestroy()
++        analyzerExecutor.shutdown()
++    }
++
++    private inner class MarkerView : View(this@HyperlapseActivity) {
++        private val outline = Paint(3).apply {
++            color = 0xFF00F0FF.toInt()
++            strokeWidth = 4f
++            style = Paint.Style.STROKE
++        }
++        override fun onDraw(canvas: Canvas) {
++            super.onDraw(canvas)
++            val tapped = chosenScreenPoint ?: return
++            // Intentionally static: camera content moves, the selected reticle does not.
++            outline.color = if (isTracking) 0xFF00F0FF.toInt() else 0xFFFFB347.toInt()
++            val sx = width * tapped.first
++            val sy = height * tapped.second
++            canvas.drawCircle(sx, sy, 24f, outline)
++            canvas.drawLine(sx - 38f, sy, sx - 13f, sy, outline)
++            canvas.drawLine(sx + 13f, sy, sx + 38f, sy, outline)
++            canvas.drawLine(sx, sy - 38f, sx, sy - 13f, outline)
++            canvas.drawLine(sx, sy + 13f, sx, sy + 38f, outline)
++        }
++    }
++}
++
++/** Uses writable YUV420 codec input images, with frame-wise re-framing. */
++private class SampledVideoEncoder(file: File, sourceW: Int, sourceH: Int, rotation: Int) {
++    private val outW = (min(960, sourceW) / 2) * 2
++    private val outH = (min(540, sourceH) / 2) * 2
++    private val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
++    private val muxer = MediaMuxer(file.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
++    private val bufferInfo = MediaCodec.BufferInfo()
++    private var muxerStarted = false
++    private var trackIndex = -1
++    private var lockedX: Double? = null
++    private var lockedY: Double? = null
++    private val maxLeft = (sourceW - outW).coerceAtLeast(0)
++    private val maxTop = (sourceH - outH).coerceAtLeast(0)
++
++    init {
++        require(outW > 0 && outH > 0)
++        muxer.setOrientationHint(rotation)
++        val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, outW, outH).apply {
++            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
++            setInteger(MediaFormat.KEY_BIT_RATE, 4_000_000)
++            setInteger(MediaFormat.KEY_FRAME_RATE, 30)
++            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
++        }
++        encoder.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
++        encoder.start()
++    }
++
++    fun addFrame(frame: ImageProxy, point: Point, frameNumber: Long) {
++        val index = encoder.dequeueInputBuffer(10_000)
++        if (index < 0) { drain(false); return }
++        val outputImage = encoder.getInputImage(index) ?: error("No writable YUV codec input")
++        // Set the target's output position on the first frame; no black border on later frames.
++        // Clamping is necessary when the camera moves beyond available crop margin.
++        if (lockedX == null) {
++            val initialLeft = (point.x.roundToInt() - outW / 2).coerceIn(0, maxLeft)
++            val initialTop = (point.y.roundToInt() - outH / 2).coerceIn(0, maxTop)
++            lockedX = point.x - initialLeft
++            lockedY = point.y - initialTop
++        }
++        val left = (point.x - (lockedX ?: outW / 2.0)).roundToInt().coerceIn(0, maxLeft)
++        val top = (point.y - (lockedY ?: outH / 2.0)).roundToInt().coerceIn(0, maxTop)
++        for (channel in 0..2) {
++            val src = frame.planes[channel]
++            val dst = outputImage.planes[channel]
++            val pw = if (channel == 0) outW else outW / 2
++            val ph = if (channel == 0) outH else outH / 2
++            val srcW = if (channel == 0) frame.width else frame.width / 2
++            val srcH = if (channel == 0) frame.height else frame.height / 2
++            val cropX = if (channel == 0) left else Math.floorDiv(left, 2)
++            val cropY = if (channel == 0) top else Math.floorDiv(top, 2)
++            val blank = if (channel == 0) 16.toByte() else 128.toByte()
++            val from = src.buffer
++            val into = dst.buffer
++            for (row in 0 until ph) for (col in 0 until pw) {
++                val xx = cropX + col
++                val yy = cropY + row
++                val px = if (xx in 0 until srcW && yy in 0 until srcH) {
++                    from.get(yy * src.rowStride + xx * src.pixelStride)
++                } else blank
++                into.put(row * dst.rowStride + col * dst.pixelStride, px)
++            }
++        }
++        val inputSize = encoder.getInputBuffer(index)?.capacity() ?: (outW * outH * 3 / 2)
++        encoder.queueInputBuffer(index, 0, inputSize, frameNumber * 1_000_000L / 30L, 0)
++        drain(false)
++    }
++
++    fun finish() {
++        val idx = encoder.dequeueInputBuffer(500_000)
++        if (idx >= 0) encoder.queueInputBuffer(idx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
++        drain(true)
++        encoder.stop()
++        encoder.release()
++        if (muxerStarted) muxer.stop()
++        muxer.release()
++    }
++
++    private fun drain(end: Boolean) {
++        var emptyPolls = 0
++        while (true) {
++            val index = encoder.dequeueOutputBuffer(bufferInfo, if (end) 30_000 else 0)
++            when (index) {
++                MediaCodec.INFO_TRY_AGAIN_LATER -> {
++                    if (!end || ++emptyPolls > 100) return
++                }
++                MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
++                    if (!muxerStarted) {
++                        trackIndex = muxer.addTrack(encoder.outputFormat)
++                        muxer.start()
++                        muxerStarted = true
++                    }
++                }
++                else -> if (index >= 0) {
++                    val buffer = encoder.getOutputBuffer(index)
++                    if (bufferInfo.size > 0 && buffer != null && muxerStarted) {
++                        buffer.position(bufferInfo.offset)
++                        buffer.limit(bufferInfo.offset + bufferInfo.size)
++                        muxer.writeSampleData(trackIndex, buffer, bufferInfo)
++                    }
++                    val eos = bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
++                    encoder.releaseOutputBuffer(index, false)
++                    if (eos) return
++                }
++            }
++        }
++    }
++}
