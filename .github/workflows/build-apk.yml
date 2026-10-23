@@ -38,6 +38,11 @@ jobs:
           git apply --check Hyperlapse_V1.patch
           git apply Hyperlapse_V1.patch
 
+      - name: Fix Kotlin permission callback
+        run: |
+          sed -i 's/permissions: Array<out String>/permissions: Array<String>/' app/src/main/java/com/google/jetpackcamera/HyperlapseActivity.kt
+          grep -n 'override fun onRequestPermissionsResult' app/src/main/java/com/google/jetpackcamera/HyperlapseActivity.kt
+
       - name: Build AI Operator PRO APK
         run: |
           chmod +x gradlew
